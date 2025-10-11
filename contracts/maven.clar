@@ -1,5 +1,19 @@
-;; Oracle contract with signature verification and access control
-(define-map oracles principal { signer: principal, last-value: (buff 32), last-height: uint })
+;; Oracle contract with signature verification, replay protection, and access control
+
+;; Storage: oracles keyed by user principal
+;; - signer-pubkey: compressed secp256k1 pubkey (33 bytes)
+;; - last-value: optional 32-byte buffer (none before first update)
+;; - last-height: last update block height
+;; - nonce: monotonically increasing counter to prevent signature replay
+(define-map oracles
+  principal
+  {
+    signer-pubkey: (buff 33),
+    last-value: (optional (buff 32)),
+    last-height: uint,
+    nonce: uint
+  }
+)
 
 ;; Contract owner for admin functions
 (define-data-var contract-owner principal tx-sender)
@@ -9,7 +23,7 @@
 
 ;; Constants
 (define-constant MIN-BLOCK-INTERVAL u10) ;; Minimum blocks between updates
-(define-constant MAX-VALUE-AGE u1000) ;; Maximum age for oracle values
+(define-constant MAX-VALUE-AGE u1000)    ;; Maximum age for oracle values (used by helper)
 
 ;; Error constants
 (define-constant ERR-NOT-AUTHORIZED (err u100))
@@ -17,93 +31,147 @@
 (define-constant ERR-INVALID-SIGNATURE (err u102))
 (define-constant ERR-TOO-FREQUENT (err u103))
 (define-constant ERR-NOT-OWNER (err u104))
+(define-constant ERR-INVALID-NONCE (err u105))
 
-;; Register an oracle with authorized signer
-(define-public (register-oracle (signer principal))
-  (begin 
-    (map-set oracles tx-sender { 
-      signer: signer, 
-      last-value: 0x0000000000000000000000000000000000000000000000000000000000000000, 
-      last-height: u0 
-    })
-    (print { event: "oracle-registered", user: tx-sender, signer: signer })
-    (ok true)))
+;; Domain separator for message hashing (ASCII: "maven-oracle-v1")
+(define-constant MSG_DOMAIN 0x6d6176656e2d6f7261636c652d7631)
 
-;; Submit oracle proof with signature verification and enhanced validation
-(define-public (submit-proof (user principal) (value (buff 32)) (sig (buff 64)))
-  (let ((oracle-data (unwrap! (map-get? oracles user) ERR-ORACLE-NOT-FOUND)))
-    (let ((registered-signer (get signer oracle-data))
-          (last-update-height (get last-height oracle-data))
-          ;; Create message hash from user + value for signature verification
-          (message-hash (keccak256 (concat (unwrap-panic (to-consensus-buff? user)) value))))
-      ;; Enhanced validation: Prevent spam by requiring minimum block interval
-      (asserts! (or (is-eq last-update-height u0) 
-                    (>= stacks-block-height (+ last-update-height MIN-BLOCK-INTERVAL))) 
-                ERR-TOO-FREQUENT)
-      ;; Verify the signature was created by the registered signer
-      ;; Note: For now, we'll use tx-sender verification as a placeholder
-      ;; In production, you'd need to implement proper public key to principal mapping
-      (asserts! (is-eq tx-sender registered-signer) ERR-INVALID-SIGNATURE)
-      ;; Update oracle data only if all validations pass
-      (map-set oracles user { 
-        signer: registered-signer, 
-        last-value: value, 
-        last-height: stacks-block-height 
-      })
-      ;; Increment update counter and emit event
-      (var-set oracle-updates (+ (var-get oracle-updates) u1))
-      (print { event: "proof-submitted", user: user, value: value, height: stacks-block-height })
-      (ok true))))
+;; Private helper: build the message hash for signing.
+;; Hash = keccak256( MSG_DOMAIN || user || value || nonce )
+;; Notes:
+;; - user and nonce are converted to consensus buffers to ensure canonical encoding.
+(define-private (make-message-hash (user principal) (value (buff 32)) (nonce uint))
+  (let (
+        (user-buff (unwrap-panic (to-consensus-buff? user)))
+        (nonce-buff (unwrap-panic (to-consensus-buff? nonce)))
+       )
+    (keccak256 (concat MSG_DOMAIN (concat user-buff (concat value nonce-buff))))
+  )
+)
 
-;; Admin function: Update oracle signer
-(define-public (update-oracle-signer (user principal) (new-signer principal))
-  (let ((oracle-data (unwrap! (map-get? oracles user) ERR-ORACLE-NOT-FOUND)))
+;; Register or update an oracle's signer pubkey.
+;; - If the caller has no entry, create it with empty last-value and zeroed height/nonce.
+;; - If an entry exists, only update signer-pubkey without resetting last-height, last-value, or nonce.
+(define-public (register-oracle (signer-pubkey (buff 33)))
+  (match (map-get? oracles tx-sender)
+    existing
+      (begin
+        (map-set oracles tx-sender (merge existing { signer-pubkey: signer-pubkey }))
+        (print { event: "oracle-signer-updated", user: tx-sender })
+        (ok true))
     (begin
-      (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-OWNER)
-      (map-set oracles user (merge oracle-data { signer: new-signer }))
-      (print { event: "signer-updated", user: user, old-signer: (get signer oracle-data), new-signer: new-signer })
-      (ok true))))
+      (map-set oracles tx-sender {
+        signer-pubkey: signer-pubkey,
+        last-value: none,
+        last-height: u0,
+        nonce: u0
+      })
+      (print { event: "oracle-registered", user: tx-sender })
+      (ok true)))
+)
 
-;; Admin function: Remove oracle
+;; Submit oracle proof with signature verification, nonce-based replay protection, and rate limiting.
+;; - nonce must equal stored nonce + 1.
+;; - signature must verify against keccak256(MSG_DOMAIN || user || value || nonce) and stored signer-pubkey.
+(define-public (submit-proof (user principal) (value (buff 32)) (sig (buff 65)) (nonce uint))
+  (let (
+        (oracle-data (unwrap! (map-get? oracles user) ERR-ORACLE-NOT-FOUND))
+        (registered-pub (get signer-pubkey oracle-data))
+        (last-update-height (get last-height oracle-data))
+        (stored-nonce (get nonce oracle-data))
+        (msg-hash (make-message-hash user value nonce))
+       )
+    ;; Enforce minimum block interval (first update exempt when last-height == u0)
+    (asserts! (or (is-eq last-update-height u0)
+                  (>= stacks-block-height (+ last-update-height MIN-BLOCK-INTERVAL)))
+              ERR-TOO-FREQUENT)
+    ;; Nonce must strictly increase by 1 to prevent replay
+    (asserts! (is-eq nonce (+ stored-nonce u1)) ERR-INVALID-NONCE)
+    ;; Verify signature was produced by the stored signer-pubkey
+    (asserts! (secp256k1-verify msg-hash sig registered-pub) ERR-INVALID-SIGNATURE)
+    ;; Update oracle state
+    (map-set oracles user {
+      signer-pubkey: registered-pub,
+      last-value: (some value),
+      last-height: stacks-block-height,
+      nonce: nonce
+    })
+    ;; Increment update counter and emit event
+    (var-set oracle-updates (+ (var-get oracle-updates) u1))
+    (print { event: "proof-submitted", user: user, value: value, height: stacks-block-height, nonce: nonce })
+    (ok true))
+)
+
+;; Admin function: Update oracle signer pubkey (owner-only).
+;; Does not modify last-height, last-value, or nonce.
+(define-public (update-oracle-signer (user principal) (new-signer-pubkey (buff 33)))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-OWNER)
+    (let ((oracle-data (unwrap! (map-get? oracles user) ERR-ORACLE-NOT-FOUND)))
+      (map-set oracles user (merge oracle-data { signer-pubkey: new-signer-pubkey }))
+      (print {
+        event: "signer-updated",
+        user: user
+      })
+      (ok true)))
+)
+
+;; Admin function: Remove oracle (owner-only).
 (define-public (remove-oracle (user principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-OWNER)
     (asserts! (is-some (map-get? oracles user)) ERR-ORACLE-NOT-FOUND)
     (map-delete oracles user)
     (print { event: "oracle-removed", user: user })
-    (ok true)))
+    (ok true))
+)
 
-;; Admin function: Transfer ownership
+;; Admin function: Transfer ownership (owner-only).
 (define-public (transfer-ownership (new-owner principal))
   (begin
     (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-OWNER)
     (var-set contract-owner new-owner)
     (print { event: "ownership-transferred", old-owner: tx-sender, new-owner: new-owner })
-    (ok true)))
+    (ok true))
+)
 
 ;; Read-only function to get oracle data
 (define-read-only (get-oracle-data (user principal))
-  (map-get? oracles user))
+  (map-get? oracles user)
+)
 
-;; Read-only function to check if oracle data is fresh (within specified blocks)
+;; Read-only function to check if oracle data is fresh (within specified blocks, caller-provided)
 (define-read-only (is-oracle-fresh (user principal) (max-age uint))
   (match (map-get? oracles user)
     oracle-data (>= (+ (get last-height oracle-data) max-age) stacks-block-height)
-    false))
+    false)
+)
 
-;; Read-only function to get just the latest value
+;; Read-only helper: return latest value only if it's considered fresh using MAX-VALUE-AGE.
+(define-read-only (get-latest-value-if-fresh (user principal))
+  (match (map-get? oracles user)
+    oracle-data (if (>= (+ (get last-height oracle-data) MAX-VALUE-AGE) stacks-block-height)
+                    (get last-value oracle-data) ;; may be none if never updated
+                    none)
+    none)
+)
+
+;; Read-only function to get just the latest value (may be none if never updated)
 (define-read-only (get-latest-value (user principal))
   (match (map-get? oracles user)
-    oracle-data (some (get last-value oracle-data))
-    none))
+    oracle-data (get last-value oracle-data)
+    none)
+)
 
 ;; Read-only function to get contract owner
 (define-read-only (get-contract-owner)
-  (var-get contract-owner))
+  (var-get contract-owner)
+)
 
 ;; Read-only function to get total oracle updates
 (define-read-only (get-oracle-updates-count)
-  (var-get oracle-updates))
+  (var-get oracle-updates)
+)
 
 ;; Read-only function to check if oracle can be updated (respects minimum interval)
 (define-read-only (can-update-oracle (user principal))
@@ -111,4 +179,5 @@
     oracle-data (let ((last-update (get last-height oracle-data)))
                   (or (is-eq last-update u0)
                       (>= stacks-block-height (+ last-update MIN-BLOCK-INTERVAL))))
-    false))
+    false)
+)
