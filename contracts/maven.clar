@@ -11,7 +11,8 @@
     signer-pubkey: (buff 33),
     last-value: (optional (buff 32)),
     last-height: uint,
-    nonce: uint
+    nonce: uint,
+    active: bool
   }
 )
 
@@ -32,6 +33,7 @@
 (define-constant ERR-TOO-FREQUENT (err u103))
 (define-constant ERR-NOT-OWNER (err u104))
 (define-constant ERR-INVALID-NONCE (err u105))
+(define-constant ERR-ORACLE-INACTIVE (err u106))
 
 ;; Domain separator for message hashing (ASCII: "maven-oracle-v1")
 (define-constant MSG_DOMAIN 0x6d6176656e2d6f7261636c652d7631)
@@ -64,7 +66,8 @@
         signer-pubkey: signer-pubkey,
         last-value: none,
         last-height: u0,
-        nonce: u0
+        nonce: u0,
+        active: true
       })
       (print { event: "oracle-registered", user: tx-sender })
       (ok true)))
@@ -79,8 +82,10 @@
         (registered-pub (get signer-pubkey oracle-data))
         (last-update-height (get last-height oracle-data))
         (stored-nonce (get nonce oracle-data))
+        (is-active (get active oracle-data))
         (msg-hash (make-message-hash user value nonce))
        )
+    (asserts! is-active ERR-ORACLE-INACTIVE)
     ;; Enforce minimum block interval (first update exempt when last-height == u0)
     (asserts! (or (is-eq last-update-height u0)
                   (>= stacks-block-height (+ last-update-height MIN-BLOCK-INTERVAL)))
@@ -90,12 +95,12 @@
     ;; Verify signature was produced by the stored signer-pubkey
     (asserts! (secp256k1-verify msg-hash sig registered-pub) ERR-INVALID-SIGNATURE)
     ;; Update oracle state
-    (map-set oracles user {
+    (map-set oracles user (merge oracle-data {
       signer-pubkey: registered-pub,
       last-value: (some value),
       last-height: stacks-block-height,
       nonce: nonce
-    })
+    }))
     ;; Increment update counter and emit event
     (var-set oracle-updates (+ (var-get oracle-updates) u1))
     (print { event: "proof-submitted", user: user, value: value, height: stacks-block-height, nonce: nonce })
@@ -124,6 +129,16 @@
     (map-delete oracles user)
     (print { event: "oracle-removed", user: user })
     (ok true))
+)
+
+;; Admin function: pause or resume oracle updates (owner-only).
+(define-public (set-oracle-active (user principal) (is-active bool))
+  (begin
+    (asserts! (is-eq tx-sender (var-get contract-owner)) ERR-NOT-OWNER)
+    (let ((oracle-data (unwrap! (map-get? oracles user) ERR-ORACLE-NOT-FOUND)))
+      (map-set oracles user (merge oracle-data { active: is-active }))
+      (print { event: "oracle-status-updated", user: user, active: is-active })
+      (ok true)))
 )
 
 ;; Admin function: Transfer ownership (owner-only).
